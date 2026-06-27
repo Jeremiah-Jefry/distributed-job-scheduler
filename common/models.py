@@ -69,6 +69,7 @@ class RequestVoteResponse(BaseModel):
 class AppendEntriesRequest(BaseModel):
     term: int
     leader_id: str
+    leader_url: Optional[str] = None  # URL clients/workers should redirect to
     prev_log_index: int
     prev_log_term: int
     entries: list[LogEntry]
