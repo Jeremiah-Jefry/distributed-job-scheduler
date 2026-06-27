@@ -3,13 +3,13 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-async-009688.svg)](https://fastapi.tiangolo.com/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Status](https://img.shields.io/badge/status-under%20development-orange.svg)](#what-this-demonstrates)
+[![Version](https://img.shields.io/badge/version-1.0%20complete-brightgreen.svg)](#fault-tolerance-verified-failure-scenarios)
 
 A fault-tolerant, distributed job scheduling system built from first principles in Python — implementing a simplified Raft consensus protocol for leader election and log replication, lease-based job dispatch, at-least-once delivery, idempotent execution, and fencing-token-based split-brain protection.
 
 This is not a wrapper around Celery or RabbitMQ. The coordinator cluster, consensus logic, leader election, log replication, and failure-recovery paths are implemented from scratch — the goal is to demonstrate working understanding of distributed-systems fundamentals, not to integrate an existing queue.
 
-> 🚧 **Under active development.** This README documents the full intended design. Some endpoints and components below are implemented; others are in progress — see inline notes in the [API Reference](#api-reference).
+> ✅ **Version 1 complete.** Every behavior in [Fault Tolerance: Verified Failure Scenarios](#fault-tolerance-verified-failure-scenarios) below has been manually verified by killing real processes — leader crash, worker crash mid-job, duplicate submission, duplicate execution, stale-leader fencing, and dead-letter handling — not just covered by unit tests in isolation.
 
 ---
 
@@ -23,7 +23,7 @@ This is not a wrapper around Celery or RabbitMQ. The coordinator cluster, consen
 - [Getting Started](#getting-started)
 - [API Reference](#api-reference)
 - [Job Lifecycle](#job-lifecycle)
-- [Fault Tolerance: What's Actually Tested](#fault-tolerance-whats-actually-tested)
+- [Fault Tolerance: Verified Failure Scenarios](#fault-tolerance-verified-failure-scenarios)
 - [Testing](#testing)
 - [Future Work](#future-work)
 - [License](#license)
@@ -189,27 +189,25 @@ docker-compose start coordinator-1
 
 ## API Reference
 
-> Endpoints marked **(planned)** are part of the committed design and land as the project progresses.
-
 ### Coordinator — Raft internal RPCs (node-to-node only)
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/raft/request_vote` | Candidate requests a vote from a peer during an election. *(planned)* |
-| `POST` | `/raft/append_entries` | Leader replicates log entries / sends heartbeats. *(planned)* |
+| `POST` | `/raft/request_vote` | Candidate requests a vote from a peer during an election. ✅ implemented |
+| `POST` | `/raft/append_entries` | Leader replicates log entries / sends heartbeats. ✅ implemented |
 
 ### Coordinator — Client/worker-facing
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Node liveness + identity check. ✅ implemented |
-| `POST` | `/submit_job` | Submit a job with an idempotency key. Redirects to leader if called on a follower. *(planned)* |
-| `GET` | `/job/{job_id}` | Poll job status. *(planned)* |
-| `POST` | `/worker/register` | Worker registers itself with the leader. *(planned)* |
-| `POST` | `/worker/poll_job` | Worker requests a job lease. *(planned)* |
-| `POST` | `/worker/complete_job` | Worker reports successful completion (carries fencing term). *(planned)* |
-| `POST` | `/worker/fail_job` | Worker reports failure for retry/dead-letter handling. *(planned)* |
-| `GET` | `/status` | Cluster-wide status: current leader, queue depth, dead-letter count. *(planned)* |
+| `POST` | `/submit_job` | Submit a job with an idempotency key. Redirects to leader if called on a follower. ✅ implemented |
+| `GET` | `/job/{job_id}` | Poll job status. ✅ implemented |
+| `POST` | `/worker/register` | Worker registers itself with the leader. ✅ implemented |
+| `POST` | `/worker/poll_job` | Worker requests a job lease. ✅ implemented |
+| `POST` | `/worker/complete_job` | Worker reports successful completion (carries fencing term). ✅ implemented |
+| `POST` | `/worker/fail_job` | Worker reports failure for retry/dead-letter handling. ✅ implemented |
+| `GET` | `/status` | Cluster-wide status: current leader, queue depth, dead-letter count. ✅ implemented |
 
 ### Worker
 
@@ -237,16 +235,40 @@ A job's lease carries the leader's Raft **term** at the time it was issued. Comp
 
 ---
 
-## Fault Tolerance: What's Actually Tested
+## Fault Tolerance: Verified Failure Scenarios
 
-| Scenario | Expected Behavior |
-|---|---|
-| Leader crashes | Remaining nodes elect a new leader within the election timeout window; no job state is lost (it was already replicated to a majority before crash). |
-| Worker crashes mid-job | Lease expires; job returns to `PENDING` and is picked up by a different worker — this is the at-least-once guarantee in action. |
-| Duplicate job submission (same idempotency key) | Second submission returns the existing job rather than creating a duplicate. |
-| Redelivered job executes twice | Execution-level dedupe table ensures the side effect only happens once. |
-| Deposed leader tries to validate a stale lease | Rejected — fencing token (term) no longer matches current leader's term. |
-| Network partition isolates minority of coordinators | Minority cannot elect a leader or commit writes (no quorum) — preserves consistency over availability for that partition, per CAP tradeoffs. |
+Each scenario below was manually reproduced by killing real running processes — not simulated in a mock. These map directly to the core failure-recovery requirements from the project's internal spec (Section 7, "Core Behaviors That MUST Work").
+
+| Scenario | Expected Behavior | Status |
+|---|---|---|
+| Leader crashes mid-operation | Remaining nodes elect a new leader within the election timeout window; no committed job is lost. | ✅ Verified |
+| Worker crashes mid-job | Lease expires; job returns to `PENDING` and is picked up by a different worker — the at-least-once guarantee in action. | ✅ Verified |
+| Duplicate job submission (same idempotency key) | Second submission returns the existing `job_id` rather than creating a duplicate. | ✅ Verified |
+| Redelivered job executes twice | Execution-level dedupe check ensures the side effect only happens once, even if the original worker's late report arrives after redelivery. | ✅ Verified |
+| Deposed leader tries to validate a stale lease | Rejected — the lease's fencing token (Raft term) no longer matches the current leader's term. | ✅ Verified |
+| Job exhausts retry attempts | Moves to `DEAD_LETTER` and stops being retried. | ✅ Verified |
+
+### Reproducing these yourself
+
+```bash
+# 1. Start the cluster (see Getting Started), then submit a job and note its job_id
+
+# Leader crash recovery:
+#   Ctrl+C the terminal running the current leader, then:
+curl http://localhost:8002/status   # confirm a new leader was elected
+
+# Worker crash mid-job:
+#   Ctrl+C a worker terminal right after it polls a job, then watch it get
+#   picked up by the other worker once its lease expires:
+curl http://localhost:<leader_port>/job/<job_id>
+
+# Duplicate submission:
+curl -X POST http://localhost:<leader_port>/submit_job \
+  -d '{"idempotency_key": "demo-1", "payload": {}}'
+curl -X POST http://localhost:<leader_port>/submit_job \
+  -d '{"idempotency_key": "demo-1", "payload": {}}'
+# both calls return the same job_id
+```
 
 ---
 
@@ -257,9 +279,9 @@ pytest tests/ -v
 ```
 
 Includes:
-- Unit tests for Raft term/vote logic and state transitions
-- Integration tests simulating leader crash, worker crash, and stale-leader fencing
-- A chaos script that randomly stops/starts containers on a timer during a sustained job submission load, asserting no job is lost or double-executed
+- Unit tests for Raft term/vote correctness and role-transition logic
+- Integration tests for all six scenarios in [Fault Tolerance: Verified Failure Scenarios](#fault-tolerance-verified-failure-scenarios), each driven by actually starting and killing processes rather than mocking the failure
+- Submission and idempotency edge cases (concurrent duplicate submissions, late redelivery reports)
 
 ---
 
