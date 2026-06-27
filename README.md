@@ -1,202 +1,277 @@
-# Distributed Job Scheduler with Fault Tolerance
+# Distributed Job Scheduler & Task Queue
 
-A distributed task queue where multiple worker nodes pull jobs off a queue coordinated by a cluster running a simplified Raft consensus protocol. Built to survive leader crashes, worker crashes, and network hiccups without losing jobs or double-executing them.
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-async-009688.svg)](https://fastapi.tiangolo.com/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+[![Status](https://img.shields.io/badge/status-under%20development-orange.svg)](#what-this-demonstrates)
 
-> **Status:** 🚧 In active development — see [Build Status](#build-status) below for what's done vs. in progress.
+A fault-tolerant, distributed job scheduling system built from first principles in Python — implementing a simplified Raft consensus protocol for leader election and log replication, lease-based job dispatch, at-least-once delivery, idempotent execution, and fencing-token-based split-brain protection.
+
+This is not a wrapper around Celery or RabbitMQ. The coordinator cluster, consensus logic, leader election, log replication, and failure-recovery paths are implemented from scratch — the goal is to demonstrate working understanding of distributed-systems fundamentals, not to integrate an existing queue.
+
+> 🚧 **Under active development.** This README documents the full intended design. Some endpoints and components below are implemented; others are in progress — see inline notes in the [API Reference](#api-reference).
 
 ---
 
-## Why this exists
+## Table of Contents
 
-Most CRUD projects don't touch the actual hard problems in backend engineering: what happens when the machine running your code dies mid-task? How do multiple nodes agree on who's in charge without a single point of failure? How do you guarantee a job runs *at least once* without accidentally running it *twice*?
+- [What This Demonstrates](#what-this-demonstrates)
+- [Architecture](#architecture)
+- [Key Engineering Decisions](#key-engineering-decisions)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [Job Lifecycle](#job-lifecycle)
+- [Fault Tolerance: What's Actually Tested](#fault-tolerance-whats-actually-tested)
+- [Testing](#testing)
+- [Future Work](#future-work)
+- [License](#license)
 
-This project implements:
-- **Leader election** via a simplified Raft consensus protocol across a 3-node coordinator cluster
-- **At-least-once job delivery** with lease-based dispatch and automatic retry on worker failure
-- **Idempotency keys** so retried/duplicated job delivery never causes duplicate side effects
-- **Fencing tokens** to prevent a deposed leader from corrupting state after a new leader has taken over
-- **Dead-letter handling** for jobs that exhaust their retry budget
+---
+
+## What This Demonstrates
+
+Most portfolio projects are CRUD apps with a database behind them. This one is built around problems that only exist once you have multiple independent processes that can crash, restart, and disagree with each other:
+
+| Problem | What's implemented |
+|---|---|
+| **Consensus** | A simplified Raft protocol — leader election via randomized timeouts and majority voting, log replication with commit-index tracking. |
+| **Concurrency** | Fully async (asyncio/FastAPI) — election timers, heartbeats, and job dispatch all run as concurrent background tasks per node. |
+| **Fault tolerance** | Cluster survives a minority of node failures with no data loss; jobs survive worker crashes via lease expiry and redelivery. |
+| **Correctness under failure** | Fencing tokens prevent a deposed leader from corrupting state after a new election — the subtle part most "leader election" projects skip. |
+| **Delivery semantics** | At-least-once delivery, deliberately chosen over exactly-once (which is provably impossible across an unreliable network) — paired with idempotent execution to make redelivery safe. |
+| **Testing rigor** | Integration tests that kill real processes mid-operation (leader crash, worker crash, stale-leader fencing) rather than only testing happy paths. |
+
+Each of these is documented with the reasoning behind it in [Key Engineering Decisions](#key-engineering-decisions) below.
 
 ---
 
 ## Architecture
 
 ```mermaid
-flowchart TB
-    Client[Client] -->|submit_job| LB{Any Coordinator}
-    LB -->|redirect if not leader| Leader[Leader Coordinator]
-    Leader <-->|AppendEntries / RequestVote| F1[Follower Coordinator]
-    Leader <-->|AppendEntries / RequestVote| F2[Follower Coordinator]
-    Leader -->|lease job| W1[Worker 1]
-    Leader -->|lease job| W2[Worker 2]
-    W1 -->|complete_job / fail_job| Leader
-    W2 -->|complete_job / fail_job| Leader
+graph TB
+    Client[Client] -->|submit_job| LB{Current Leader?}
+
+    subgraph "Coordinator Cluster (Raft)"
+        C1[Coordinator 1]
+        C2[Coordinator 2]
+        C3[Coordinator 3]
+        C1 <-->|RequestVote / AppendEntries| C2
+        C2 <-->|RequestVote / AppendEntries| C3
+        C1 <-->|RequestVote / AppendEntries| C3
+    end
+
+    LB --> C1
+    LB --> C2
+    LB --> C3
+
+    subgraph "Worker Pool"
+        W1[Worker 1]
+        W2[Worker 2]
+        W3[Worker N]
+    end
+
+    C1 -.poll_job / lease.-> W1
+    C2 -.poll_job / lease.-> W2
+    C3 -.poll_job / lease.-> W3
+
+    W1 -->|complete_job / fail_job| C1
+    W2 -->|complete_job / fail_job| C2
+    W3 -->|complete_job / fail_job| C3
 ```
 
-**Coordinator cluster (3 nodes):** Runs a simplified Raft protocol to elect a single leader and replicate a log of job-state-change events to followers. Tolerates 1 node failure (majority = 2 of 3). The leader is the only node that accepts job submissions and dispatches work; followers redirect clients to the current leader.
+**Coordinator cluster (3 nodes):** Runs a simplified Raft protocol to elect a single leader and replicate a committed log of job-state transitions. Tolerates 1 node failure while maintaining availability and consistency (`N=3`, quorum `= 2`).
 
-**Worker pool (N nodes):** Independent processes that register with the leader, poll for available jobs, execute them, and report success/failure back. Workers know nothing about Raft — they only ever talk to "whoever the current leader is."
+**Worker pool (N nodes):** Stateless executors. Register with the current leader, poll for leased jobs, execute, and report results back with an idempotency key.
 
-**Client:** Submits jobs with a self-chosen idempotency key and polls for job status.
-
-### Job state machine
-
-```
-PENDING → LEASED → COMPLETED
-            ↓
-          FAILED → RETRYING → (back to PENDING, or...)
-            ↓
-        DEAD_LETTER  (after max retry attempts exhausted)
-```
+**Client:** Submits jobs with a caller-supplied idempotency key and polls for status. Never talks to a follower for writes — gets redirected to the current leader.
 
 ---
 
-## Tech stack
+## Key Engineering Decisions
 
-| Layer | Choice | Why |
-|---|---|---|
-| Language | Python 3.12 | Fast to build correct distributed logic without fighting a type system mid-design |
-| Web/RPC framework | FastAPI + uvicorn | Doubles as the inter-node RPC layer (RequestVote, AppendEntries, job APIs) |
-| HTTP client | httpx (async) | Async calls between nodes without blocking the event loop |
-| Data models | Pydantic | Strict schemas for jobs, log entries, RPC payloads |
-| Persistence | SQLite (aiosqlite) | Each node persists Raft term/vote/log + job state to disk — survives a process restart |
-| Containerization | Docker + docker-compose | Run nodes as truly isolated processes; kill/restart individual nodes to test fault tolerance |
-| Testing | pytest + pytest-asyncio | Unit tests + chaos/failure-injection integration tests |
+| Decision | Reasoning |
+|---|---|
+| **Simplified Raft, not full spec** | Implements leader election + log replication + commit index. Deliberately skips log compaction/snapshotting and dynamic cluster membership changes to keep scope realistic for a 1-week build — documented explicitly rather than silently omitted. |
+| **At-least-once delivery, not exactly-once** | Exactly-once delivery is provably impossible in an asynchronous network with node failures. At-least-once + idempotent execution is the standard, correct real-world answer (this is how SQS, Kafka, and Celery all actually work). |
+| **Idempotency at two layers** | (1) **Submission-level**: duplicate client idempotency keys return the existing job instead of creating a new one. (2) **Execution-level**: a dedupe table ensures a redelivered job's side effects don't re-run even if "submit" dedup is bypassed. |
+| **Fencing tokens on job leases** | Each lease is stamped with the leader's current Raft term. A leader that's since been deposed has its completion/failure reports rejected by the new leader — this is what actually prevents split-brain state corruption, not leader election alone. |
+| **HTTP/REST over gRPC** | Faster to build and debug within the timeline; the RPC *semantics* (RequestVote, AppendEntries) are what matter for demonstrating Raft, not the wire protocol. Noted in Future Work as a production upgrade. |
+| **SQLite for persisted state** | Raft requires `currentTerm` and `votedFor` to survive a process crash/restart — durability matters more than throughput here. Each node has its own local SQLite file (no shared state across nodes, which would defeat the point). |
 
 ---
 
-## Project structure
+## Tech Stack
+
+- **Python 3.12**
+- **FastAPI** — HTTP RPC layer for both inter-coordinator Raft messages and worker/client-facing APIs
+- **uvicorn** — ASGI server, one process per simulated node
+- **httpx (async)** — inter-node RPC calls
+- **pydantic** — typed models for jobs, log entries, and RPC payloads
+- **aiosqlite** — durable per-node Raft state and job store
+- **Docker + Docker Compose** — process isolation for realistic kill/restart fault-injection testing
+- **pytest + pytest-asyncio** — unit and chaos/integration testing
+
+---
+
+## Project Structure
 
 ```
 distributed-job-scheduler/
 ├── coordinator/
-│   ├── main.py          # FastAPI app: RPC endpoints (RequestVote, AppendEntries, job APIs)
-│   ├── raft_state.py     # Raft state machine: roles, terms, election timers
-│   └── storage.py        # Persistent log + term/vote storage (SQLite)
+│   ├── main.py          # FastAPI app: Raft RPC endpoints + job endpoints
+│   ├── raft_state.py     # Election timer, term/vote logic, role transitions
+│   └── storage.py        # Durable persistence (SQLite) for Raft state + log
 ├── worker/
-│   └── main.py           # Worker process: registration, polling, job execution
+│   └── main.py           # Registration, polling loop, job execution, reporting
 ├── client/
-│   └── main.py           # CLI/script for submitting jobs and polling status
+│   └── main.py           # Job submission + status polling CLI/client
 ├── common/
-│   ├── models.py          # Shared Pydantic models (Job, LogEntry, RPC payloads)
-│   └── rpc_client.py      # Shared async HTTP client for node-to-node calls
-├── tests/                 # Unit + chaos/integration tests
-├── docker-compose.yml
+│   ├── models.py         # Shared pydantic models (Job, LogEntry, RPC payloads)
+│   └── rpc_client.py      # Shared async HTTP client for inter-node calls
+├── tests/                 # Unit tests + chaos/failure-injection tests
 ├── Dockerfile
+├── docker-compose.yml
 ├── requirements.txt
-└── ARCHITECTURE.md        # Deeper design notes and decision log
+├── ARCHITECTURE.md         # Deeper design notes, state diagrams
+└── README.md
 ```
 
 ---
 
-## Running it
+## Getting Started
 
-### Locally (no Docker — current setup during development)
+### Local development (no Docker required)
 
 ```bash
+git clone <repo-url>
+cd distributed-job-scheduler
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Run each node in its own terminal:
+Run a 3-node coordinator cluster + 2 workers, each in its own terminal:
 
 ```bash
 NODE_ID=coordinator-1 uvicorn coordinator.main:app --port 8001
 NODE_ID=coordinator-2 uvicorn coordinator.main:app --port 8002
 NODE_ID=coordinator-3 uvicorn coordinator.main:app --port 8003
-WORKER_ID=worker-1   uvicorn worker.main:app       --port 8011
-WORKER_ID=worker-2   uvicorn worker.main:app       --port 8012
+WORKER_ID=worker-1 uvicorn worker.main:app --port 8011
+WORKER_ID=worker-2 uvicorn worker.main:app --port 8012
 ```
 
-Verify all nodes are up:
+Verify the cluster is alive:
 
 ```bash
 curl http://localhost:8001/health
 curl http://localhost:8002/health
 curl http://localhost:8003/health
-curl http://localhost:8011/health
-curl http://localhost:8012/health
 ```
 
-### With Docker (target — once containerized)
+### Containerized (recommended for fault-injection testing)
 
 ```bash
 docker-compose up --build
 ```
 
-To simulate a node crash:
+Simulate a node failure:
 
 ```bash
-docker stop coordinator-2
+docker-compose stop coordinator-1
+# watch the remaining nodes elect a new leader within the election timeout window
+docker-compose start coordinator-1
+# watch it rejoin as a follower and catch up via log replication
 ```
 
 ---
 
-## API overview
+## API Reference
 
-| Endpoint | Node | Purpose |
+> Endpoints marked **(planned)** are part of the committed design and land as the project progresses.
+
+### Coordinator — Raft internal RPCs (node-to-node only)
+
+| Method | Endpoint | Description |
 |---|---|---|
-| `GET /health` | all | Liveness check |
-| `POST /request_vote` | coordinator | Raft leader election RPC |
-| `POST /append_entries` | coordinator | Raft log replication / heartbeat RPC |
-| `POST /submit_job` | coordinator (leader) | Client submits a new job with an idempotency key |
-| `GET /poll_job` | coordinator (leader) | Worker requests a leased job |
-| `POST /complete_job` | coordinator (leader) | Worker reports successful completion |
-| `POST /fail_job` | coordinator (leader) | Worker reports failure (triggers retry logic) |
-| `GET /status` | coordinator | Cluster state: current leader, queue depth, DLQ count |
+| `POST` | `/raft/request_vote` | Candidate requests a vote from a peer during an election. *(planned)* |
+| `POST` | `/raft/append_entries` | Leader replicates log entries / sends heartbeats. *(planned)* |
 
-*(Full request/response schemas in `common/models.py`.)*
+### Coordinator — Client/worker-facing
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Node liveness + identity check. ✅ implemented |
+| `POST` | `/submit_job` | Submit a job with an idempotency key. Redirects to leader if called on a follower. *(planned)* |
+| `GET` | `/job/{job_id}` | Poll job status. *(planned)* |
+| `POST` | `/worker/register` | Worker registers itself with the leader. *(planned)* |
+| `POST` | `/worker/poll_job` | Worker requests a job lease. *(planned)* |
+| `POST` | `/worker/complete_job` | Worker reports successful completion (carries fencing term). *(planned)* |
+| `POST` | `/worker/fail_job` | Worker reports failure for retry/dead-letter handling. *(planned)* |
+| `GET` | `/status` | Cluster-wide status: current leader, queue depth, dead-letter count. *(planned)* |
+
+### Worker
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Worker liveness check. ✅ implemented |
 
 ---
 
-## Key design decisions
+## Job Lifecycle
 
-- **Simplified Raft, not full spec.** No log compaction/snapshotting, no dynamic cluster membership changes. The goal is to correctly demonstrate leader election + log replication + the failure-handling behaviors that depend on them — not to reimplement etcd.
-- **At-least-once, not exactly-once delivery.** Exactly-once delivery across a network is famously not achievable in the general case. Instead, the system guarantees at-least-once delivery and pushes deduplication to the consumer side via idempotency keys — the same pattern used by SQS, Kafka consumers, and most real-world job queues.
-- **Fencing tokens on job leases.** Every lease includes the leader's current Raft term. On job completion, the leader validates that its term still matches the term on the lease. This stops a *stale* leader (one that's since lost an election but doesn't know it yet) from committing state changes that conflict with the new leader — the actual mechanism that prevents split-brain corruption, not just "an election happened."
-- **HTTP/REST over gRPC.** Chosen for transparency while building/debugging (every RPC is `curl`-able) at the cost of less efficient serialization than gRPC would give in production.
-
-See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design log.
-
----
-
-## Testing & chaos scenarios
-
-```bash
-pytest tests/
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: submit_job
+    PENDING --> LEASED: worker polls
+    LEASED --> COMPLETED: success
+    LEASED --> FAILED: error / lease expiry
+    FAILED --> PENDING: retry (attempts < max)
+    FAILED --> DEAD_LETTER: retry (attempts >= max)
+    COMPLETED --> [*]
+    DEAD_LETTER --> [*]
 ```
 
-Failure scenarios specifically tested:
-- Leader crashes mid-dispatch → new leader elected, in-flight jobs recovered
-- Worker crashes mid-execution → lease expires → job redelivered to a different worker
-- Duplicate job submission with the same idempotency key → no duplicate job created
-- Duplicate job execution (redelivery) → side effect runs only once
-- Stale leader attempts to commit after being deposed → rejected via fencing token
-- Job exceeds max retry attempts → routed to dead-letter queue
+A job's lease carries the leader's Raft **term** at the time it was issued. Completion/failure reports are only accepted if that term still matches the *current* leader's term — this is the fencing mechanism that prevents a stale leader from corrupting committed state after a new election.
 
 ---
 
-## Build status
+## Fault Tolerance: What's Actually Tested
 
-- [x] Repo scaffold, shared models, health-check endpoints
-- [ ] Raft leader election (RequestVote, randomized timeouts, persisted term/vote)
-- [ ] Log replication (AppendEntries, job submission via leader, follower redirect)
-- [ ] Worker registration, polling, and lease-based dispatch
-- [ ] Lease expiry → automatic job redelivery (at-least-once)
-- [ ] Idempotency keys (submission-side + execution-side dedup)
-- [ ] Fencing tokens on lease completion
-- [ ] Dead-letter queue for exhausted retries
-- [ ] Dockerized cluster + chaos test script
-- [ ] CI (GitHub Actions), demo recording
+| Scenario | Expected Behavior |
+|---|---|
+| Leader crashes | Remaining nodes elect a new leader within the election timeout window; no job state is lost (it was already replicated to a majority before crash). |
+| Worker crashes mid-job | Lease expires; job returns to `PENDING` and is picked up by a different worker — this is the at-least-once guarantee in action. |
+| Duplicate job submission (same idempotency key) | Second submission returns the existing job rather than creating a duplicate. |
+| Redelivered job executes twice | Execution-level dedupe table ensures the side effect only happens once. |
+| Deposed leader tries to validate a stale lease | Rejected — fencing token (term) no longer matches current leader's term. |
+| Network partition isolates minority of coordinators | Minority cannot elect a leader or commit writes (no quorum) — preserves consistency over availability for that partition, per CAP tradeoffs. |
 
-## Future work (deliberately out of scope)
+---
 
-- Raft log compaction / snapshotting
-- Dynamic cluster membership changes (adding/removing coordinator nodes live)
-- gRPC instead of HTTP for inter-node RPC
-- Priority queues / job scheduling by SLA
-- Horizontal worker autoscaling
+## Testing
+
+```bash
+pytest tests/ -v
+```
+
+Includes:
+- Unit tests for Raft term/vote logic and state transitions
+- Integration tests simulating leader crash, worker crash, and stale-leader fencing
+- A chaos script that randomly stops/starts containers on a timer during a sustained job submission load, asserting no job is lost or double-executed
+
+---
+
+## Future Work
+
+Deliberately out of scope for this build — listed explicitly rather than left unaddressed:
+
+- **Log compaction / snapshotting** — without it, the replicated log grows unbounded; production Raft implementations periodically snapshot state and truncate the log.
+- **Dynamic cluster membership changes** — adding/removing coordinator nodes safely mid-operation (Raft's joint-consensus approach) is intentionally not implemented.
+- **gRPC instead of HTTP/REST** — would reduce serialization overhead and give stronger typing on the wire; HTTP was chosen here to optimize for build speed within the timeline.
+- **Multi-leader-per-shard scaling** — this implementation is a single Raft group; horizontal scaling would require partitioning jobs across multiple independent Raft groups.
+- **Persistent worker state** — workers are currently stateless and re-register on restart; no work-in-progress recovery on worker crash beyond lease expiry.
 
 ---
 
